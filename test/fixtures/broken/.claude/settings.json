@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": ["Read(./.env)"]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "WebFetch",
+        "hooks": [
+          { "type": "command", "command": "node scripts/url-guard.mjs" }
+        ]
+      }
+    ]
+  }
+}

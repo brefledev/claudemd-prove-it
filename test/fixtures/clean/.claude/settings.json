@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "deny": ["Write(./secrets/**)", "Read(./secrets/**)"]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          { "type": "command", "command": "node scripts/lint-check.mjs" }
+        ]
+      }
+    ]
+  }
+}
