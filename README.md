@@ -1,5 +1,7 @@
 # claudemd-prove-it
 
+[![test](https://github.com/brefledev/claudemd-prove-it/actions/workflows/test.yml/badge.svg)](https://github.com/brefledev/claudemd-prove-it/actions/workflows/test.yml)
+
 Your CLAUDE.md is full of rules written like law: never force-push, don't touch that folder. The Claude Code docs state what those rules are worth:
 
 > Claude treats them as context, not enforced configuration. To block an action
