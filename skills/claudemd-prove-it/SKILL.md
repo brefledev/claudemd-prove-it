@@ -11,9 +11,10 @@ any point. The audit is one file and one settings surface; it fits in one
 context.
 
 1. Locate `prove-it.mjs`. Look in this skill's directory first, then the project
-   root. Run `node prove-it.mjs --json` from the project root and read the
-   output. If the command fails, stop and report the failure instead of
-   improvising an audit by hand.
+   root. Run `node prove-it.mjs --json` from the project root and read stdout
+   even when the command exits 1; exit 1 is a complete audit containing
+   ordinary findings. Stop only when it exits 2, crashes, or produces no valid
+   JSON.
 
 2. The JSON is the deterministic layer. Its numbers pass through to your
    report unchanged: token estimates, import errors, broken enforcement

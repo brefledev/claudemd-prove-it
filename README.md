@@ -87,7 +87,7 @@ Add an HTML comment naming the enforcer, on the rule's line or the line below:
 - Answer first, short.       <!-- enforced-by: none -->
 ```
 
-Three selector forms: `deny|ask|allow <rule>` matches a permission entry, `script <name>` matches a script run by any hook, `hook <Event> <text>` matches an event's matcher or command. `none` says "this rule is advisory on purpose" and stops the tool from counting it against you. Comma-separate multiple claims.
+Three selector forms: `deny|ask|allow <rule>` exactly matches a permission entry, `script <name>` matches an existing script run by an active hook, `hook <Event> <text>` matches an active event's matcher or command. `none` says "this rule is advisory on purpose" and stops the tool from counting it against you. Comma-separate multiple claims; commas inside permission parentheses stay part of that permission.
 
 **Annotations cost zero tokens at runtime:** Claude Code strips block-level HTML comments from CLAUDE.md before injecting it into context, so the model never sees them and they never spend a token. (This tool's token estimate strips them too, for the same reason.)
 

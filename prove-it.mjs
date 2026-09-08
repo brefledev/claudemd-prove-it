@@ -19,7 +19,7 @@
 //
 // Node stdlib only. No dependencies. Reads files; never writes, never spawns.
 
-import { readFileSync, readdirSync, existsSync, statSync } from 'node:fs';
+import { readFileSync, readdirSync, statSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, relative, sep, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 
@@ -37,8 +37,8 @@ const SKIP_DIRS = new Set([
 
 // ---------- CLI ----------
 const argv = process.argv.slice(2);
-const flags = new Set(argv.filter(a => a.startsWith('--')));
-const positional = argv.filter(a => !a.startsWith('--'));
+const flags = new Set(argv.filter(a => a.startsWith('-')));
+const positional = argv.filter(a => !a.startsWith('-'));
 
 if (flags.has('--help') || flags.has('-h')) {
   console.log(readSelfDoc());
@@ -54,6 +54,7 @@ const OPTS = {
   user: flags.has('--user'),
   projectOnly: flags.has('--project-only'),
   noAncestors: flags.has('--no-ancestors'),
+  excludes: [],
   color: !flags.has('--no-color') && process.stdout.isTTY && !OPTS_JSON_SAFE(),
 };
 function OPTS_JSON_SAFE() { return flags.has('--json'); }
@@ -73,6 +74,9 @@ function tryStat(path) {
 function expandHome(p) {
   return p.startsWith('~/') || p === '~' ? join(homedir(), p.slice(1)) : p;
 }
+function userConfigDir() {
+  return process.env.CLAUDE_CONFIG_DIR ? resolve(process.env.CLAUDE_CONFIG_DIR) : join(homedir(), '.claude');
+}
 function rel(p) {
   const r = relative(ROOT, p);
   return r && !r.startsWith('..') ? r.split(sep).join('/') : p.split(sep).join('/');
@@ -84,32 +88,84 @@ function uniq(arr) { return [...new Set(arr)]; }
 // matching the real loader's behavior.
 function maskCode(text, { inline = true } = {}) {
   const lines = text.split('\n');
-  let inFence = false;
+  let fenceChar = null;
+  let fenceLength = 0;
   const out = lines.map(line => {
-    const fence = /^(\s*)(```|~~~)/.test(line);
-    if (fence) { inFence = !inFence; return ' '.repeat(line.length); }
-    if (inFence) return ' '.repeat(line.length);
+    const fence = line.match(/^\s*(`{3,}|~{3,})/);
+    if (!fenceChar && fence) {
+      fenceChar = fence[1][0];
+      fenceLength = fence[1].length;
+      return ' '.repeat(line.length);
+    }
+    if (fenceChar) {
+      const close = line.match(/^\s*(`+|~+)\s*$/);
+      if (close && close[1][0] === fenceChar && close[1].length >= fenceLength) {
+        fenceChar = null;
+        fenceLength = 0;
+      }
+      return ' '.repeat(line.length);
+    }
     if (!inline) return line;
     return line.replace(/`[^`]*`/g, m => ' '.repeat(m.length));
   });
   return out.join('\n');
 }
 
+function processComments(text, remove = false) {
+  let inComment = false;
+  let fenceChar = null;
+  let fenceLength = 0;
+  return text.split('\n').map(line => {
+    if (fenceChar) {
+      const close = line.match(/^\s*(`+|~+)\s*$/);
+      if (close && close[1][0] === fenceChar && close[1].length >= fenceLength) fenceChar = null;
+      return line;
+    }
+    if (!inComment) {
+      const openingFence = line.match(/^\s*(`{3,}|~{3,})/);
+      if (openingFence) {
+        fenceChar = openingFence[1][0];
+        fenceLength = openingFence[1].length;
+        return line;
+      }
+    }
+    let out = ''; let pos = 0;
+    while (pos < line.length) {
+      if (inComment) {
+        const end = line.indexOf('-->', pos);
+        const stop = end === -1 ? line.length : end + 3;
+        if (!remove) out += ' '.repeat(stop - pos);
+        pos = stop;
+        if (end !== -1) inComment = false;
+      } else {
+        const start = commentStartOutsideInlineCode(line, pos);
+        if (start === -1) { out += line.slice(pos); break; }
+        out += line.slice(pos, start);
+        pos = start;
+        inComment = true;
+      }
+    }
+    return out;
+  }).join('\n');
+}
+
+function commentStartOutsideInlineCode(line, from) {
+  let ticks = 0;
+  for (let i = from; i < line.length; i++) {
+    if (line[i] === '`') {
+      let length = 1;
+      while (line[i + length] === '`') length++;
+      ticks = ticks === length ? 0 : ticks || length;
+      i += length - 1;
+    } else if (!ticks && line.startsWith('<!--', i)) return i;
+  }
+  return -1;
+}
+
 // Remove HTML comments (outside code) the way the loader strips them before
 // injection — the token estimate must not bill the user for comments.
 function stripComments(text) {
-  const masked = maskCode(text);
-  let out = '';
-  let i = 0;
-  while (i < text.length) {
-    const start = masked.indexOf('<!--', i);
-    if (start === -1) { out += text.slice(i); break; }
-    const end = masked.indexOf('-->', start + 4);
-    out += text.slice(i, start);
-    if (end === -1) break; // unterminated comment: strip to EOF
-    i = end + 3;
-  }
-  return out;
+  return processComments(text, true);
 }
 
 function estTokens(text) {
@@ -123,12 +179,28 @@ function estTokens(text) {
 
 function discoverMemoryFiles(findings) {
   const files = []; // {path, kind, launch:boolean, via}
-  const seen = new Set();
+  const seen = new Map();
+  const excluded = path => OPTS.excludes.some(pattern => {
+    const logical = resolve(path).split(sep).join('/');
+    let real = logical;
+    try { real = realpathSync(path).split(sep).join('/'); } catch {}
+    return globMatch(pattern.split('\\').join('/'), logical) || globMatch(pattern.split('\\').join('/'), real);
+  });
   const add = (path, kind, launch, via) => {
     const key = resolve(path);
-    if (seen.has(key) || !tryStat(key)) return null;
-    seen.add(key);
+    const stat = tryStat(key);
+    if (!stat?.isFile() || excluded(key)) return null;
+    if (seen.has(key)) {
+      const entry = seen.get(key);
+      if (launch && !entry.launch) {
+        entry.launch = true;
+        entry.kind = kind;
+        entry.via = via || entry.via;
+      }
+      return entry;
+    }
     const entry = { path: key, kind, launch, via: via || null };
+    seen.set(key, entry);
     files.push(entry);
     return entry;
   };
@@ -159,8 +231,8 @@ function discoverMemoryFiles(findings) {
 
   // user scope (opt-in)
   if (OPTS.user) {
-    add(join(homedir(), '.claude', 'CLAUDE.md'), 'user', true);
-    for (const f of walkMd(join(homedir(), '.claude', 'rules'))) add(f, 'user-rule', true);
+    add(join(userConfigDir(), 'CLAUDE.md'), 'user', true);
+    for (const f of walkMd(join(userConfigDir(), 'rules'))) add(f, 'user-rule', true);
   }
 
   // .claude/rules/**/*.md
@@ -178,31 +250,35 @@ function discoverMemoryFiles(findings) {
     add(f, 'nested', false);
   }
 
-  // @imports, breadth-first to depth 4, from every launch-loaded file
-  const queue = files.filter(f => f.launch).map(f => ({ path: f.path, depth: 0 }));
-  const visited = new Set(queue.map(q => resolve(q.path)));
+  // Resolve imports in launch and on-demand memory. Imports inherit their
+  // source's loading mode; a launch import promotes a previously lazy file.
+  const queue = files.map(f => ({ path: f.path, depth: 0, launch: f.launch }));
+  const visited = new Map(queue.map(q => [resolve(q.path), q.launch]));
   while (queue.length) {
-    const { path, depth } = queue.shift();
+    const { path, depth, launch } = queue.shift();
     const text = tryRead(path);
     if (text === null) continue;
     for (const imp of findImports(text)) {
-      const target = resolveImport(imp.spec, path);
-      if (!target || !tryStat(target)) {
-        findings.push(err('broken-import',
-          `${rel(path)}:${imp.line} imports @${imp.spec} — file not found` +
-          (looksLikePackage(imp.spec) ? ' (if this is a package name, wrap it in backticks so it is not parsed as an import)' : '')));
-        continue;
-      }
-      const key = resolve(target);
-      if (visited.has(key)) continue; // already loaded or cycle
       if (depth + 1 > IMPORT_MAX_DEPTH) {
         findings.push(warn('import-depth',
           `${rel(path)}:${imp.line} imports @${imp.spec} beyond ${IMPORT_MAX_DEPTH} hops — Claude Code stops resolving here`));
         continue;
       }
-      visited.add(key);
-      add(target, 'import', true, `${rel(path)}:${imp.line}`);
-      queue.push({ path: target, depth: depth + 1 });
+      const target = resolveImport(imp.spec, path);
+      const targetStat = target && tryStat(target);
+      if (!targetStat?.isFile()) {
+        findings.push(err('broken-import',
+          `${rel(path)}:${imp.line} imports @${imp.spec} — file not found or not a regular file` +
+          (looksLikePackage(imp.spec) ? ' (if this is a package name, wrap it in backticks so it is not parsed as an import)' : '')));
+        continue;
+      }
+      const key = resolve(target);
+      const previous = visited.get(key);
+      const added = add(target, 'import', launch, `${rel(path)}:${imp.line}`);
+      if (!added) continue;
+      if (previous === true || previous === launch) continue;
+      visited.set(key, launch || previous || false);
+      queue.push({ path: target, depth: depth + 1, launch });
     }
   }
 
@@ -214,14 +290,15 @@ function looksLikePackage(spec) {
 }
 
 function findImports(text) {
-  const masked = maskCode(text);
+  const masked = maskCode(processComments(text));
   const out = [];
-  const re = /(^|[\s(])@([~.\w][\w./~\\-]*)/g;
+  const re = /(^|[\s(])@((?:[A-Za-z]:[\\/]|\/|~\/|\.\.?[\\/]|[\w-])[\w./~\\:-]*)/g;
   let m;
   while ((m = re.exec(masked)) !== null) {
     let spec = m[2].replace(/[.,;:!?)]+$/, '');
     if (!spec || spec === '.' || spec === '..') continue;
-    const line = masked.slice(0, m.index).split('\n').length;
+    const at = m.index + m[1].length;
+    const line = masked.slice(0, at).split('\n').length;
     out.push({ spec, line });
   }
   return out;
@@ -242,26 +319,56 @@ function parseFrontmatter(text) {
     const kv = line.match(/^(\w[\w-]*):\s*(.*)$/);
     if (kv) {
       listKey = kv[2].trim() === '' ? kv[1] : null;
-      if (kv[2].trim() !== '') fm[kv[1]] = kv[2].trim();
+      if (kv[2].trim() !== '') {
+        const value = stripYamlComment(kv[2]).trim();
+        if (/^\[.*\]$/.test(value)) fm[kv[1]] = splitYamlFlow(value.slice(1, -1));
+        else fm[kv[1]] = unquote(value);
+      }
       else fm[kv[1]] = [];
       continue;
     }
     const item = line.match(/^\s*-\s*(.+)$/);
-    if (item && listKey) fm[listKey].push(item[1].trim().replace(/^["']|["']$/g, ''));
+    if (item && listKey) fm[listKey].push(unquote(stripYamlComment(item[1]).trim()));
   }
   return fm;
+}
+
+function stripYamlComment(value) {
+  let quote = null;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if ((c === '"' || c === "'") && value[i - 1] !== '\\') quote = quote === c ? null : quote || c;
+    if (c === '#' && !quote && (i === 0 || /\s/.test(value[i - 1]))) return value.slice(0, i);
+  }
+  return value;
+}
+function unquote(value) { return value.replace(/^(["'])([\s\S]*)\1$/, '$2'); }
+function splitYamlFlow(value) {
+  const parts = []; let quote = null; let start = 0;
+  for (let i = 0; i <= value.length; i++) {
+    const c = value[i];
+    if ((c === '"' || c === "'") && value[i - 1] !== '\\') quote = quote === c ? null : quote || c;
+    if ((c === ',' && !quote) || i === value.length) { parts.push(unquote(value.slice(start, i).trim())); start = i + 1; }
+  }
+  return parts.filter(Boolean);
 }
 
 function walkMd(dir) {
   const out = [];
   const stack = [dir];
+  const visited = new Set();
   while (stack.length) {
     const d = stack.pop();
+    let real;
+    try { real = realpathSync(d); } catch { continue; }
+    if (visited.has(real)) continue;
+    visited.add(real);
     let entries;
     try { entries = readdirSync(d, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
       const p = join(d, e.name);
-      if (e.isDirectory()) { if (!SKIP_DIRS.has(e.name)) stack.push(p); }
+      const isDir = e.isDirectory() || (e.isSymbolicLink() && tryStat(p)?.isDirectory());
+      if (isDir) { if (!SKIP_DIRS.has(e.name)) stack.push(p); }
       else if (e.name.endsWith('.md')) out.push(p);
     }
   }
@@ -274,7 +381,7 @@ function walkNested(root) {
   const stack = [{ dir: root, depth: 0 }];
   while (stack.length) {
     const { dir, depth } = stack.pop();
-    if (depth > SCAN_DIR_DEPTH || count > SCAN_FILE_CAP) break;
+    if (depth > SCAN_DIR_DEPTH || count > SCAN_FILE_CAP) continue;
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
@@ -292,17 +399,20 @@ function walkNested(root) {
 
 // ---------- discovery: settings surface ----------
 function discoverSettings(findings) {
-  const sources = [
+  const sources = [];
+  if (!OPTS.projectOnly) {
+    sources.push({ path: join(userConfigDir(), 'settings.json'), scope: 'user' });
+  }
+  sources.push(
     { path: join(ROOT, '.claude', 'settings.json'), scope: 'project' },
     { path: join(ROOT, '.claude', 'settings.local.json'), scope: 'local' },
-  ];
-  if (!OPTS.projectOnly) {
-    sources.push({ path: join(homedir(), '.claude', 'settings.json'), scope: 'user' });
-  }
+  );
 
   const hooks = [];       // {event, matcher, matcherNames[], command, scripts[], scope}
   const permissions = []; // {list, rule, tool, pattern, scope}
+  const excludes = [];
   let anySettings = false;
+  let disableAllHooks = false;
 
   for (const src of sources) {
     const text = tryRead(src.path);
@@ -313,25 +423,42 @@ function discoverSettings(findings) {
       findings.push(err('settings-parse', `${rel(src.path)} is not valid JSON (${e.message}) — Claude Code will ignore it, and so does this audit`));
       continue;
     }
-    for (const [event, groups] of Object.entries(json.hooks || {})) {
+    if (!json || typeof json !== 'object' || Array.isArray(json)) {
+      findings.push(err('settings-schema', `${rel(src.path)} must contain a JSON object — Claude Code will ignore this settings file`));
+      continue;
+    }
+    if (typeof json.disableAllHooks === 'boolean') disableAllHooks = json.disableAllHooks;
+    if (Array.isArray(json.claudeMdExcludes)) excludes.push(...json.claudeMdExcludes.filter(x => typeof x === 'string'));
+    const hookObject = json.hooks && typeof json.hooks === 'object' && !Array.isArray(json.hooks) ? json.hooks : {};
+    for (const [event, groups] of Object.entries(hookObject)) {
       if (!Array.isArray(groups)) continue;
       for (const group of groups) {
+        if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
         const matcher = group.matcher ?? '*';
-        for (const h of group.hooks || []) {
-          const command = h.command || h.url || h.prompt || (h.server ? `${h.server}.${h.tool}` : '') || '';
+        if (!Array.isArray(group.hooks)) continue;
+        for (const h of group.hooks) {
+          if (!h || typeof h !== 'object' || Array.isArray(h)) continue;
+          const args = Array.isArray(h.args) ? h.args.map(String) : [];
+          const command = String(h.command || h.url || h.prompt || (h.server ? `${h.server}.${h.tool}` : '') || '');
+          const commandLine = [command, ...args].join(' ');
+          const hookType = h.type || 'command';
+          const scriptRefs = hookType === 'command' ? extractScriptRefs(command, args) : [];
           hooks.push({
-            event, matcher,
-            matcherNames: splitMatcher(matcher),
-            type: h.type || 'command',
-            command,
-            scripts: extractScripts(command),
+            event, matcher: String(matcher),
+            matcherNames: splitMatcher(String(matcher)),
+            type: hookType,
+            command: commandLine,
+            scripts: scriptRefs.map(s => s.split(/[/\\]/).pop()),
+            scriptsExist: scriptRefs.every(scriptExists),
             scope: src.scope,
           });
         }
       }
     }
     for (const list of ['deny', 'ask', 'allow']) {
-      for (const rule of (json.permissions || {})[list] || []) {
+      const configured = json.permissions && typeof json.permissions === 'object' && Array.isArray(json.permissions[list])
+        ? json.permissions[list] : [];
+      for (const rule of configured) {
         const m = String(rule).match(/^([\w-]+)\((.*)\)$/);
         permissions.push({
           list, rule: String(rule),
@@ -346,7 +473,7 @@ function discoverSettings(findings) {
   if (!anySettings) {
     findings.push(warn('no-settings', 'no .claude/settings.json found — every rule in this CLAUDE.md relies on the model choosing to follow it'));
   }
-  return { hooks, permissions };
+  return { hooks: disableAllHooks ? [] : hooks.filter(h => h.scriptsExist), permissions, excludes, disableAllHooks };
 }
 
 function splitMatcher(matcher) {
@@ -356,12 +483,32 @@ function splitMatcher(matcher) {
   return [matcher]; // regex; matched by substring test later
 }
 
-function extractScripts(command) {
-  const out = [];
-  const re = /[\w./\\~$-]+\.(mjs|cjs|js|sh|ps1|py|rb)\b/g;
-  let m;
-  while ((m = re.exec(command)) !== null) out.push(m[0].split(/[/\\]/).pop());
-  return uniq(out);
+function extractScriptRefs(command, args = []) {
+  return uniq([...shellWords(command), ...args].filter(arg => /\.(?:mjs|cjs|js|sh|ps1|py|rb)$/i.test(arg)));
+}
+
+function shellWords(command) {
+  const words = []; let word = ''; let quote = null;
+  for (let i = 0; i <= command.length; i++) {
+    const c = command[i];
+    if (i === command.length || (!quote && /\s/.test(c))) {
+      if (word) words.push(word);
+      word = '';
+    } else if ((c === '"' || c === "'") && command[i - 1] !== '\\') {
+      quote = quote === c ? null : quote || c;
+    } else word += c;
+  }
+  return words;
+}
+
+function scriptExists(script) {
+  let candidate = script.replace(/^['"]|['"]$/g, '');
+  candidate = candidate.replace(/^\$\{CLAUDE_PROJECT_DIR\}(?=[/\\]|$)/, ROOT);
+  candidate = candidate.replace(/^\$CLAUDE_PROJECT_DIR(?=[/\\]|$)/, ROOT);
+  candidate = candidate.replace(/^%CLAUDE_PROJECT_DIR%(?=[/\\]|$)/i, ROOT);
+  if (candidate.startsWith('~')) candidate = expandHome(candidate);
+  if (!isAbsolute(candidate)) candidate = resolve(ROOT, candidate);
+  return !!tryStat(candidate)?.isFile();
 }
 
 // ---------- directive extraction ----------
@@ -385,7 +532,7 @@ function extractDirectives(files) {
     if (text === null) continue;
     // fences masked so code never reads as rules; inline code kept, since
     // backticked paths are the strongest content a rule carries
-    const masked = maskCode(text, { inline: false });
+    const masked = maskCode(processComments(text), { inline: false });
     const rawLines = text.split('\n');
     const lines = masked.split('\n');
 
@@ -396,18 +543,19 @@ function extractDirectives(files) {
         .replace(/[*_#>`]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
-      if (clean.length < 8) continue;
+      const annotation = findAnnotation(rawLines, unit.lines);
+      if (clean.length < 8 && !annotation) continue;
       const hard = HARD_MARKERS.some(re => re.test(clean));
       const soft = !hard && SOFT_MARKERS.some(re => re.test(clean));
-      if (!hard && !soft) continue;
+      if (!hard && !soft && !annotation) continue;
       directives.push({
         id: `d${++id}`,
         file: f.path,
         line: unit.lines[0] + 1,
         text: clean,
         raw,
-        strength: hard ? 'hard' : 'soft',
-        annotation: findAnnotation(rawLines, unit.lines),
+        strength: hard || annotation ? 'hard' : 'soft',
+        annotation,
       });
     }
   }
@@ -447,7 +595,10 @@ function* units(lines) {
 //   <!-- enforced-by: none -->
 // Attach it at the end of the rule's line or on the line directly below.
 function findAnnotation(rawLines, unitLineIdxs) {
-  const scan = [...unitLineIdxs, unitLineIdxs[unitLineIdxs.length - 1] + 1];
+  const last = unitLineIdxs[unitLineIdxs.length - 1];
+  const scan = [...unitLineIdxs];
+  const next = rawLines[last + 1];
+  if (next !== undefined && /^\s*<!--/.test(next)) scan.push(last + 1);
   for (const idx of scan) {
     const line = rawLines[idx];
     if (line === undefined) break;
@@ -459,7 +610,8 @@ function findAnnotation(rawLines, unitLineIdxs) {
 }
 
 function parseAnnotation(body) {
-  const claims = body.split(',').map(s => s.trim()).filter(Boolean).map(claim => {
+  const parts = splitClaims(body);
+  const claims = (parts.length ? parts : ['']).map(claim => {
     if (/^none$/i.test(claim)) return { type: 'none' };
     let m = claim.match(/^hook\s+(\w+)\s+(.+)$/i);
     if (m) return { type: 'hook', event: m[1], needle: m[2] };
@@ -470,6 +622,22 @@ function parseAnnotation(body) {
     return { type: 'invalid', raw: claim };
   });
   return { claims };
+}
+
+function splitClaims(body) {
+  const out = []; let depth = 0; let quote = null; let start = 0;
+  for (let i = 0; i <= body.length; i++) {
+    const c = body[i];
+    if ((c === '"' || c === "'") && body[i - 1] !== '\\') quote = quote === c ? null : quote || c;
+    if (!quote && c === '(') depth++;
+    if (!quote && c === ')' && depth > 0) depth--;
+    if ((c === ',' && depth === 0 && !quote) || i === body.length) {
+      const part = body.slice(start, i).trim();
+      if (part) out.push(part);
+      start = i + 1;
+    }
+  }
+  return out;
 }
 
 function verifyAnnotation(annotation, surface) {
@@ -488,8 +656,7 @@ function verifyAnnotation(annotation, surface) {
       continue;
     }
     if (c.type === 'permission') {
-      const want = c.rule.replace(/\s+/g, '');
-      const hit = surface.permissions.find(p => p.list === c.list && p.rule.replace(/\s+/g, '') === want);
+      const hit = surface.permissions.find(p => p.list === c.list && p.rule === c.rule.trim());
       results.push({ claim: c, ok: !!hit, evidence: hit
         ? `${hit.list} rule ${hit.rule} in ${hit.scope} settings`
         : `no ${c.list} rule ${c.rule} in any settings file` });
@@ -583,7 +750,7 @@ function matchDirective(d, surface) {
     if (new RegExp(`\\b${word}\\b`, 'i').test(dText)) tools.forEach(t => toolsInRule.add(t));
   }
   for (const h of surface.hooks) {
-    const overlap = h.matcherNames.filter(n => toolsInRule.has(n));
+    const overlap = [...toolsInRule].filter(n => matcherMatchesTool(h.matcher, n));
     if (overlap.length) {
       score += 2;
       hooksHit.add(h);
@@ -612,6 +779,12 @@ function matchDirective(d, surface) {
 
   const verdict = score >= 3 ? 'likely' : score >= 2 ? 'possible' : 'prose';
   return { verdict, score, evidence: uniq(evidence).slice(0, 4), hooksHit };
+}
+
+function matcherMatchesTool(matcher, tool) {
+  if (!matcher || matcher === '*') return true;
+  if (/^[\w\s,|-]+$/.test(matcher)) return splitMatcher(matcher).some(n => n === tool);
+  try { return new RegExp(matcher).test(tool); } catch { return false; }
 }
 
 function buildEnforcementMap(directives, surface, findings) {
@@ -668,12 +841,12 @@ function checkDuplication(directives, findings) {
       const inter = [...a].filter(w => b.has(w)).length;
       const jac = inter / (a.size + b.size - inter);
       const A = directives[i], B = directives[j];
-      if (jac >= 0.65 && A.text !== B.text) {
-        findings.push(warn('duplicate',
-          `near-duplicate rules: ${rel(A.file)}:${A.line} and ${rel(B.file)}:${B.line} say close to the same thing — pick one home`));
-      } else if (jac >= 0.4 && oppositePolarity(A.text, B.text)) {
+      if (jac >= 0.4 && oppositePolarity(A.text, B.text)) {
         findings.push(warn('contradiction-candidate',
           `possible contradiction (a judgment call, not a verdict): ${rel(A.file)}:${A.line} vs ${rel(B.file)}:${B.line} — same subject, opposite polarity`));
+      } else if (jac >= 0.65) {
+        findings.push(warn('duplicate',
+          `${A.text === B.text ? 'duplicate' : 'near-duplicate'} rules: ${rel(A.file)}:${A.line} and ${rel(B.file)}:${B.line} say close to the same thing — pick one home`));
       }
     }
   }
@@ -725,7 +898,7 @@ function checkScopedRules(files, findings) {
   const stack = [{ dir: ROOT, depth: 0 }];
   while (stack.length) {
     const { dir, depth } = stack.pop();
-    if (depth > SCAN_DIR_DEPTH || count > SCAN_FILE_CAP) break;
+    if (depth > SCAN_DIR_DEPTH || count > SCAN_FILE_CAP) continue;
     let entries;
     try { entries = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
     for (const e of entries) {
@@ -746,28 +919,65 @@ function checkScopedRules(files, findings) {
 }
 
 function globMatch(glob, path) {
-  const esc = s => s.replace(/[.+^$()|[\]\\]/g, '\\$&');
-  let g = '';
-  let last = 0;
-  for (const m of glob.matchAll(/\{([^}]+)\}/g)) {
-    g += esc(glob.slice(last, m.index));
-    g += '(?:' + m[1].split(',').map(esc).join('|') + ')';
-    last = m.index + m[0].length;
+  const source = glob.split('\\').join('/');
+  const value = path.split('\\').join('/');
+  try { return new RegExp('^' + globRegex(source) + '$').test(value); } catch { return false; }
+}
+
+function globRegex(source) {
+  let re = '';
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i];
+    if (c === '*' && source[i + 1] === '*') {
+      i++;
+      if (source[i + 1] === '/') { i++; re += '(?:.*/)?'; }
+      else re += '.*';
+    } else if (c === '*') re += '[^/]*';
+    else if (c === '?') re += '[^/]';
+    else if (c === '[') {
+      const end = source.indexOf(']', i + 1);
+      if (end === -1) re += '\\[';
+      else {
+        let cls = source.slice(i + 1, end);
+        if (cls.startsWith('!')) cls = '^' + cls.slice(1);
+        re += '[' + cls.replace(/\\/g, '\\\\') + ']';
+        i = end;
+      }
+    } else if (c === '{') {
+      const end = source.indexOf('}', i + 1);
+      if (end === -1) re += '\\{';
+      else {
+        const options = source.slice(i + 1, end).split(',').map(globRegex);
+        re += '(?:' + options.join('|') + ')';
+        i = end;
+      }
+    } else re += /[.+^$()|{}\\]/.test(c) ? '\\' + c : c;
   }
-  g += esc(glob.slice(last));
-  g = g.replace(/\*\*\//g, '\u0000').replace(/\*\*/g, '\u0001').replace(/\*/g, '[^/]*')
-    .replace(/\u0000/g, '(?:.*/)?').replace(/\u0001/g, '.*');
-  try { return new RegExp('^' + g + '$').test(path); } catch { return false; }
+  return re;
 }
 
 function checkLocalGitignore(files, findings) {
   const local = files.find(f => f.kind === 'local');
   if (!local) return;
   const gi = tryRead(join(ROOT, '.gitignore'));
-  if (gi !== null && !/^\s*\/?CLAUDE\.local\.md\s*$/mi.test(gi)) {
+  if (gi !== null && !gitignoreCovers(gi, 'CLAUDE.local.md')) {
     findings.push(warn('local-not-ignored',
       'CLAUDE.local.md exists but .gitignore does not cover it — personal instructions will end up in the repo'));
   }
+}
+
+function gitignoreCovers(text, path) {
+  let ignored = false;
+  for (const raw of text.split('\n')) {
+    let pattern = raw.trim();
+    if (!pattern || pattern.startsWith('#')) continue;
+    const negated = pattern.startsWith('!');
+    if (negated) pattern = pattern.slice(1);
+    if (pattern.startsWith('/')) pattern = pattern.slice(1);
+    const match = pattern.includes('/') ? globMatch(pattern, path) : globMatch(pattern, path.split('/').pop());
+    if (match) ignored = !negated;
+  }
+  return ignored;
 }
 
 // ---------- context cost ----------
@@ -907,8 +1117,9 @@ function main() {
     process.exit(2);
   }
   const findings = [];
-  const files = discoverMemoryFiles(findings);
   const surface = discoverSettings(findings);
+  OPTS.excludes = surface.excludes;
+  const files = discoverMemoryFiles(findings);
   const directives = extractDirectives(files);
   const map = buildEnforcementMap(directives, surface, findings);
   checkDuplication(directives, findings);
