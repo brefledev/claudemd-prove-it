@@ -11,19 +11,20 @@
 //   node prove-it.mjs --all              list every prose-only rule, not a count
 //   node prove-it.mjs --strict           warnings also fail the exit code
 //   node prove-it.mjs --user             include ~/.claude/CLAUDE.md in the audit
-//   node prove-it.mjs --project-only     ignore ~/.claude/settings.json
+//   node prove-it.mjs --project-only     project settings only: no user, managed, or plugin layers
 //   node prove-it.mjs --no-ancestors     skip CLAUDE.md files above the project (CI use)
 //   node prove-it.mjs --no-color         plain output
 //
+// Settings read: user, project, local, managed (PROVE_IT_MANAGED_DIR overrides
+// the OS policy directory), and hooks of enabled plugins.
 // Exit codes: 0 = no errors · 1 = errors (or warnings with --strict) · 2 = usage/IO
-//
 // Node stdlib only. No dependencies. Reads files; never writes, never spawns.
 
 import { readFileSync, readdirSync, statSync, realpathSync } from 'node:fs';
 import { dirname, join, resolve, relative, sep, isAbsolute } from 'node:path';
 import { homedir } from 'node:os';
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const TOKEN_DIVISOR = 4;      // chars per token; a stated estimate, not a tokenizer
 const IMPORT_MAX_DEPTH = 4;   // matches Claude Code's documented limit
 const LINE_GUIDANCE = 200;    // docs: target under 200 lines per CLAUDE.md
@@ -229,6 +230,9 @@ function discoverMemoryFiles(findings) {
     findings.push(err('no-claude-md', `no CLAUDE.md found at ${rel(join(ROOT, 'CLAUDE.md'))} or .claude/CLAUDE.md`));
   }
 
+  // managed policy memory loads for every user on the machine
+  if (!OPTS.projectOnly) add(join(managedDir(), 'CLAUDE.md'), 'managed', true);
+
   // user scope (opt-in)
   if (OPTS.user) {
     add(join(userConfigDir(), 'CLAUDE.md'), 'user', true);
@@ -398,82 +402,184 @@ function walkNested(root) {
 }
 
 // ---------- discovery: settings surface ----------
-function discoverSettings(findings) {
+// Hook events, by what they can do to a rule. Only tool events carry tool
+// matchers; only enforcing events can stop, veto, or force feedback on an
+// action. SessionStart/SessionEnd/Notification/PreCompact and friends inject
+// context or observe — they never count as enforcement.
+const TOOL_EVENTS = new Set(['PreToolUse', 'PostToolUse', 'PermissionRequest']);
+const PREVENTING_EVENTS = new Set(['PreToolUse', 'PermissionRequest']);
+const ENFORCING_EVENTS = new Set([...TOOL_EVENTS, 'UserPromptSubmit', 'Stop', 'SubagentStop']);
+
+// Path rules on these tools are accepted by Claude Code but never matched: it
+// checks file access against Edit(...) and Read(...) only (docs: permissions,
+// "Write(path), Glob(path), and Grep(path) rules don't match").
+const INERT_PATH_TOOLS = { Write: 'Edit', NotebookEdit: 'Edit', MultiEdit: 'Edit', Glob: 'Read', Grep: 'Read' };
+
+function managedDir() {
+  if (process.env.PROVE_IT_MANAGED_DIR) return resolve(process.env.PROVE_IT_MANAGED_DIR);
+  if (process.platform === 'win32') return 'C:\\Program Files\\ClaudeCode';
+  if (process.platform === 'darwin') return '/Library/Application Support/ClaudeCode';
+  return '/etc/claude-code';
+}
+
+function settingsSources() {
   const sources = [];
-  if (!OPTS.projectOnly) {
-    sources.push({ path: join(userConfigDir(), 'settings.json'), scope: 'user' });
-  }
+  if (!OPTS.projectOnly) sources.push({ path: join(userConfigDir(), 'settings.json'), scope: 'user' });
   sources.push(
     { path: join(ROOT, '.claude', 'settings.json'), scope: 'project' },
     { path: join(ROOT, '.claude', 'settings.local.json'), scope: 'local' },
   );
+  if (!OPTS.projectOnly) {
+    // managed-settings.json first, then managed-settings.d/*.json alphabetically
+    sources.push({ path: join(managedDir(), 'managed-settings.json'), scope: 'managed' });
+    let dropIns = [];
+    try { dropIns = readdirSync(join(managedDir(), 'managed-settings.d')).filter(n => n.endsWith('.json') && !n.startsWith('.')).sort(); } catch {}
+    for (const n of dropIns) sources.push({ path: join(managedDir(), 'managed-settings.d', n), scope: 'managed' });
+  }
+  return sources;
+}
 
-  const hooks = [];       // {event, matcher, matcherNames[], command, scripts[], scope}
-  const permissions = []; // {list, rule, tool, pattern, scope}
+function readSettingsObject(path, findings) {
+  const text = tryRead(path);
+  if (text === null) return null;
+  let json;
+  try { json = JSON.parse(text); } catch (e) {
+    findings.push(err('settings-parse', `${rel(path)} is not valid JSON (${e.message}) — Claude Code will ignore it, and so does this audit`));
+    return null;
+  }
+  if (!json || typeof json !== 'object' || Array.isArray(json)) {
+    findings.push(err('settings-schema', `${rel(path)} must contain a JSON object — Claude Code will ignore this settings file`));
+    return null;
+  }
+  return json;
+}
+
+function discoverSettings(findings) {
+  const hooks = [];       // {id, event, matcher, matcherNames[], command, scripts[], lane, scope}
+  const permissions = []; // {list, rule, tool, pattern, scope, inert}
   const excludes = [];
+  const enabledPlugins = {};
+  const managedPlugins = new Set();
   let anySettings = false;
-  let disableAllHooks = false;
+  let disableAllHooks = false;        // user/project/local value after precedence
+  let disableManagedHooks = false;    // only managed settings can disable managed hooks
+  let allowManagedHooksOnly = false;
 
-  for (const src of sources) {
-    const text = tryRead(src.path);
-    if (text === null) continue;
-    anySettings = true;
-    let json;
-    try { json = JSON.parse(text); } catch (e) {
-      findings.push(err('settings-parse', `${rel(src.path)} is not valid JSON (${e.message}) — Claude Code will ignore it, and so does this audit`));
-      continue;
+  for (const src of settingsSources()) {
+    const json = readSettingsObject(src.path, findings);
+    if (!json) continue;
+    if (src.scope !== 'managed') anySettings = true;
+    if (typeof json.disableAllHooks === 'boolean') {
+      if (src.scope === 'managed') disableManagedHooks = disableAllHooks = json.disableAllHooks;
+      else disableAllHooks = json.disableAllHooks;
     }
-    if (!json || typeof json !== 'object' || Array.isArray(json)) {
-      findings.push(err('settings-schema', `${rel(src.path)} must contain a JSON object — Claude Code will ignore this settings file`));
-      continue;
-    }
-    if (typeof json.disableAllHooks === 'boolean') disableAllHooks = json.disableAllHooks;
+    if (src.scope === 'managed' && json.allowManagedHooksOnly === true) allowManagedHooksOnly = true;
     if (Array.isArray(json.claudeMdExcludes)) excludes.push(...json.claudeMdExcludes.filter(x => typeof x === 'string'));
-    const hookObject = json.hooks && typeof json.hooks === 'object' && !Array.isArray(json.hooks) ? json.hooks : {};
-    for (const [event, groups] of Object.entries(hookObject)) {
-      if (!Array.isArray(groups)) continue;
-      for (const group of groups) {
-        if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
-        const matcher = group.matcher ?? '*';
-        if (!Array.isArray(group.hooks)) continue;
-        for (const h of group.hooks) {
-          if (!h || typeof h !== 'object' || Array.isArray(h)) continue;
-          const args = Array.isArray(h.args) ? h.args.map(String) : [];
-          const command = String(h.command || h.url || h.prompt || (h.server ? `${h.server}.${h.tool}` : '') || '');
-          const commandLine = [command, ...args].join(' ');
-          const hookType = h.type || 'command';
-          const scriptRefs = hookType === 'command' ? extractScriptRefs(command, args) : [];
-          hooks.push({
-            event, matcher: String(matcher),
-            matcherNames: splitMatcher(String(matcher)),
-            type: hookType,
-            command: commandLine,
-            scripts: scriptRefs.map(s => s.split(/[/\\]/).pop()),
-            scriptsExist: scriptRefs.every(scriptExists),
-            scope: src.scope,
-          });
-        }
+    if (json.enabledPlugins && typeof json.enabledPlugins === 'object' && !Array.isArray(json.enabledPlugins)) {
+      for (const [key, on] of Object.entries(json.enabledPlugins)) {
+        enabledPlugins[key] = on === true;
+        if (src.scope === 'managed' && on === true) managedPlugins.add(key);
       }
     }
-    for (const list of ['deny', 'ask', 'allow']) {
-      const configured = json.permissions && typeof json.permissions === 'object' && Array.isArray(json.permissions[list])
-        ? json.permissions[list] : [];
-      for (const rule of configured) {
-        const m = String(rule).match(/^([\w-]+)\((.*)\)$/);
-        permissions.push({
-          list, rule: String(rule),
-          tool: m ? m[1] : String(rule),
-          pattern: m ? m[2] : '',
-          scope: src.scope,
-        });
-      }
+    collectHooks(json.hooks, src.scope, null, hooks, findings);
+    collectPermissions(json.permissions, src.scope, permissions, findings);
+  }
+
+  if (!OPTS.projectOnly) {
+    for (const plugin of installedPlugins(Object.keys(enabledPlugins).filter(k => enabledPlugins[k]))) {
+      const scope = `plugin:${plugin.key}`;
+      const manifest = readSettingsObject(join(plugin.root, '.claude-plugin', 'plugin.json'), []) || {};
+      let hookDoc = null;
+      if (typeof manifest.hooks === 'string') hookDoc = readSettingsObject(resolve(plugin.root, manifest.hooks), findings);
+      else if (manifest.hooks && typeof manifest.hooks === 'object') hookDoc = { hooks: manifest.hooks };
+      hookDoc = hookDoc || readSettingsObject(join(plugin.root, 'hooks', 'hooks.json'), findings);
+      if (hookDoc) collectHooks(hookDoc.hooks, scope, plugin.root, hooks, findings, managedPlugins.has(plugin.key));
     }
   }
 
   if (!anySettings) {
     findings.push(warn('no-settings', 'no .claude/settings.json found — every rule in this CLAUDE.md relies on the model choosing to follow it'));
   }
-  return { hooks: disableAllHooks ? [] : hooks.filter(h => h.scriptsExist), permissions, excludes, disableAllHooks };
+  const active = hooks.filter(h => {
+    if (h.scriptState === 'missing') return false;
+    if (h.scope === 'managed') return !disableManagedHooks;
+    if (allowManagedHooksOnly && !h.managedPlugin) return false;
+    return !disableAllHooks;
+  });
+  return { hooks: active, permissions, excludes, disableAllHooks };
+}
+
+function installedPlugins(keys) {
+  if (!keys.length) return [];
+  const registry = readSettingsObject(join(userConfigDir(), 'plugins', 'installed_plugins.json'), []);
+  const table = registry && typeof registry.plugins === 'object' ? registry.plugins : {};
+  const out = [];
+  for (const key of keys) {
+    const entries = Array.isArray(table[key]) ? table[key] : table[key] ? [table[key]] : [];
+    const root = entries.map(e => e && e.installPath).find(p => typeof p === 'string' && tryStat(p)?.isDirectory());
+    if (root) out.push({ key, root });
+  }
+  return out;
+}
+
+function collectHooks(hookObject, scope, pluginRoot, hooks, findings, managedPlugin = false) {
+  if (!hookObject || typeof hookObject !== 'object' || Array.isArray(hookObject)) return;
+  const reported = new Set();
+  for (const [event, groups] of Object.entries(hookObject)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!group || typeof group !== 'object' || Array.isArray(group)) continue;
+      const matcher = group.matcher ?? '*';
+      if (!Array.isArray(group.hooks)) continue;
+      for (const h of group.hooks) {
+        if (!h || typeof h !== 'object' || Array.isArray(h)) continue;
+        const args = Array.isArray(h.args) ? h.args.map(String) : [];
+        const command = String(h.command || h.url || h.prompt || (h.server ? `${h.server}.${h.tool}` : '') || '');
+        const commandLine = [command, ...args].join(' ');
+        const hookType = h.type || 'command';
+        const scriptRefs = hookType === 'command' ? extractScriptRefs(command, args) : [];
+        const states = scriptRefs.map(s => scriptState(s, pluginRoot));
+        const scriptState_ = states.includes('missing') ? 'missing' : states.includes('unknown') ? 'unknown' : 'ok';
+        if (scriptState_ === 'missing') {
+          for (const [i, s] of scriptRefs.entries()) {
+            if (states[i] !== 'missing' || reported.has(s)) continue;
+            reported.add(s);
+            findings.push(err('hook-script-missing',
+              `a ${event} hook in ${scope} settings runs ${s}, which does not exist — the hook fails every time it fires and enforces nothing`));
+          }
+        }
+        hooks.push({
+          id: hooks.length,
+          event, matcher: String(matcher),
+          matcherNames: splitMatcher(String(matcher)),
+          type: hookType,
+          command: commandLine,
+          scripts: scriptRefs.map(s => s.split(/[/\\]/).pop()),
+          lane: dispatcherLane(command, args, scriptRefs),
+          scriptState: scriptState_,
+          scope, managedPlugin,
+        });
+      }
+    }
+  }
+}
+
+function collectPermissions(perms, scope, permissions, findings) {
+  for (const list of ['deny', 'ask', 'allow']) {
+    const configured = perms && typeof perms === 'object' && Array.isArray(perms[list]) ? perms[list] : [];
+    for (const rule of configured) {
+      const m = String(rule).match(/^([\w-]+)\((.*)\)$/);
+      const tool = m ? m[1] : String(rule);
+      const pattern = m ? m[2] : '';
+      const inert = !!INERT_PATH_TOOLS[tool] && pattern.trim() !== '' && pattern.trim() !== '*';
+      if (inert) {
+        const fix = `${INERT_PATH_TOOLS[tool]}(${pattern})`;
+        const msg = `${list} rule ${rule} in ${scope} settings never matches — Claude Code checks file access against Edit(...) and Read(...) rules only; use ${fix}`;
+        findings.push(list === 'allow' ? warn('inert-permission', msg) : err('inert-permission', msg));
+      }
+      permissions.push({ list, rule: String(rule), tool, pattern, scope, inert });
+    }
+  }
 }
 
 function splitMatcher(matcher) {
@@ -483,15 +589,17 @@ function splitMatcher(matcher) {
   return [matcher]; // regex; matched by substring test later
 }
 
+// Scripts a command runs. Text an echo/printf prints is not run.
 function extractScriptRefs(command, args = []) {
-  return uniq([...shellWords(command), ...args].filter(arg => /\.(?:mjs|cjs|js|sh|ps1|py|rb)$/i.test(arg)));
+  return uniq([...shellWords(stripEchoes(command)), ...args].filter(arg => /\.(?:mjs|cjs|js|sh|ps1|py|rb)$/i.test(arg)));
 }
 
+// Words of a shell command; unquoted ; | & ( ) separate words the way whitespace does.
 function shellWords(command) {
   const words = []; let word = ''; let quote = null;
   for (let i = 0; i <= command.length; i++) {
     const c = command[i];
-    if (i === command.length || (!quote && /\s/.test(c))) {
+    if (i === command.length || (!quote && /[\s;|&()]/.test(c))) {
       if (word) words.push(word);
       word = '';
     } else if ((c === '"' || c === "'") && command[i - 1] !== '\\') {
@@ -501,14 +609,29 @@ function shellWords(command) {
   return words;
 }
 
-function scriptExists(script) {
+// 'ok' | 'missing' | 'unknown' (a path this audit cannot expand, such as $HOME
+// or an unset plugin root, is unknown — never reported as missing)
+function scriptState(script, pluginRoot = null) {
   let candidate = script.replace(/^['"]|['"]$/g, '');
-  candidate = candidate.replace(/^\$\{CLAUDE_PROJECT_DIR\}(?=[/\\]|$)/, ROOT);
-  candidate = candidate.replace(/^\$CLAUDE_PROJECT_DIR(?=[/\\]|$)/, ROOT);
-  candidate = candidate.replace(/^%CLAUDE_PROJECT_DIR%(?=[/\\]|$)/i, ROOT);
+  const placeholders = { CLAUDE_PROJECT_DIR: ROOT, ...(pluginRoot ? { CLAUDE_PLUGIN_ROOT: pluginRoot } : {}) };
+  for (const [name, value] of Object.entries(placeholders)) {
+    candidate = candidate.replace(new RegExp(`^(?:\\$\\{${name}\\}|\\$${name}|%${name}%)(?=[/\\\\]|$)`, 'i'), value);
+  }
+  candidate = candidate.replace(/^(?:\$\{HOME\}|\$HOME|%USERPROFILE%)(?=[/\\]|$)/i, homedir());
+  if (/\$|%\w+%/.test(candidate)) return 'unknown';
   if (candidate.startsWith('~')) candidate = expandHome(candidate);
   if (!isAbsolute(candidate)) candidate = resolve(ROOT, candidate);
-  return !!tryStat(candidate)?.isFile();
+  return tryStat(candidate)?.isFile() ? 'ok' : 'missing';
+}
+
+// A dispatcher hook runs one script with a lane name: `node adapter.mjs askgate`.
+// The lane, not the shared script, is the mechanism's identity.
+function dispatcherLane(command, args, scriptRefs) {
+  if (!scriptRefs.length) return null;
+  const words = [...shellWords(command), ...args];
+  const at = words.findIndex(w => scriptRefs.includes(w));
+  const next = at === -1 ? null : words[at + 1];
+  return next && /^[A-Za-z][\w-]*$/.test(next) ? next : null;
 }
 
 // ---------- directive extraction ----------
@@ -517,10 +640,11 @@ const HARD_MARKERS = [
   /\bforbidden\b/i, /\bbanned\b/i, /\boff[- ]limits\b/i, /\bnot allowed\b/i,
   /\brequired?\b/i, /\brequires\b/i, /\bread[- ]only\b/i, /\bblock(?:ed|s)?\b/i,
   /\bdeny\b/i, /\bno\s+\w+ing\b/i, /\bonly\s+(?:use|do|if|when|edit|write|read)\b/i,
+  /\bprohibit(?:s|ed)?\b/i, /\brefuses?\b/i, /\bmay not\b/i, /\bnot permitted\b/i, /\bdisallowed\b/i,
 ];
 const SOFT_MARKERS = [
   /\bshould(?:\s+not)?\b/i, /\bprefer\b/i, /\bavoid\b/i, /\brecommended\b/i,
-  /\bask\s+(?:first|before)\b/i, /\bplease\b/i,
+  /\bask\s+(?:first|before)\b/i, /\bplease\b/i, /\bcannot\b/i,
 ];
 
 function extractDirectives(files) {
@@ -590,7 +714,7 @@ function* units(lines) {
 // ---------- annotations ----------
 // Syntax (inert HTML comment; the loader strips comments, so this costs no context):
 //   <!-- enforced-by: hook PreToolUse Task -->
-//   <!-- enforced-by: deny Write(./protected/**) -->
+//   <!-- enforced-by: deny Edit(./protected/**) -->
 //   <!-- enforced-by: script subagent-guard.mjs -->
 //   <!-- enforced-by: none -->
 // Attach it at the end of the rule's line or on the line directly below.
@@ -657,17 +781,19 @@ function verifyAnnotation(annotation, surface) {
     }
     if (c.type === 'permission') {
       const hit = surface.permissions.find(p => p.list === c.list && p.rule === c.rule.trim());
-      results.push({ claim: c, ok: !!hit, evidence: hit
+      const live = hit && !hit.inert;
+      results.push({ claim: c, ok: !!live, evidence: live
         ? `${hit.list} rule ${hit.rule} in ${hit.scope} settings`
+        : hit ? `${hit.list} rule ${hit.rule} exists in ${hit.scope} settings but never matches (use ${INERT_PATH_TOOLS[hit.tool]}(${hit.pattern}))`
         : `no ${c.list} rule ${c.rule} in any settings file` });
       continue;
     }
     if (c.type === 'script') {
       const name = c.name.split(/[/\\]/).pop().toLowerCase();
-      const hit = surface.hooks.find(h => h.scripts.some(s => s.toLowerCase() === name));
+      const hit = surface.hooks.find(h => h.scripts.some(s => s.toLowerCase() === name) || (h.lane || '').toLowerCase() === name);
       results.push({ claim: c, ok: !!hit, hook: hit || null, evidence: hit
-        ? `${c.name} runs in a ${hit.event} hook (matcher: ${hit.matcher})`
-        : `${c.name} does not appear in any hook command` });
+        ? `${c.name} runs in a ${hit.event} hook (matcher: ${hit.matcher}, ${hit.scope} settings)`
+        : `${c.name} does not appear in any active hook command` });
     }
   }
   return results;
@@ -677,6 +803,19 @@ function verifyAnnotation(annotation, surface) {
 const TOOL_NAMES = ['Bash', 'PowerShell', 'Edit', 'Write', 'Read', 'NotebookEdit',
   'WebFetch', 'WebSearch', 'Glob', 'Grep', 'Task', 'Agent', 'Workflow', 'Skill',
   'AskUserQuestion', 'TodoWrite'];
+// Tool names that are also English words count only when written as a tool:
+// `Read`, Read(...), "the Read tool", or inside a matcher list like Edit|Write.
+const AMBIGUOUS_TOOLS = new Set(['Edit', 'Write', 'Read', 'Glob', 'Task', 'Agent', 'Workflow', 'Skill']);
+function toolsNamedIn(raw) {
+  const found = new Set();
+  for (const t of TOOL_NAMES) {
+    const re = AMBIGUOUS_TOOLS.has(t)
+      ? new RegExp(`\`${t}[\`(]|(?<![\\w-])${t}\\(|(?<![\\w-])${t}\\s+tools?\\b|(?<![\\w-])${t}\\|\\w|\\w\\|${t}(?![\\w-])`)
+      : new RegExp(`(?<![\\w-])${t}(?![\\w-])`);
+    if (re.test(raw)) found.add(t);
+  }
+  return found;
+}
 const CONCEPT_TOOLS = {
   subagent: ['Task', 'Agent', 'Workflow'],
   'sub-agent': ['Task', 'Agent', 'Workflow'],
@@ -698,6 +837,9 @@ const STOPWORDS = new Set(['this', 'that', 'with', 'from', 'your', 'never', 'alw
 const NOT_PATHS = new Set(['read/write', 'write/read', 'and/or', 'either/or',
   'y/n', 'r/w', 'i/o', 'a/b', '24/7', 'tcp/ip', 'his/her', 'he/she', 'pass/fail']);
 
+// Rule-side path tokens, each kept with whether it reads as a path (has a
+// slash, a dot-file, or an extension). Bare backticked words such as `main`
+// are kept for nothing: they are names, not paths.
 function pathTokens(text) {
   const out = [];
   // backticked spans in the raw text are the strongest path signals
@@ -706,79 +848,130 @@ function pathTokens(text) {
   for (const m of text.matchAll(/(?:^|\s)((?:[\w.*-]+\/)+[\w.*-]*|\.\w[\w.]*|[\w-]+\.(?:json|md|env|txt|yml|yaml|lock))(?=\s|$|[,.;:])/g)) {
     out.push(m[1]);
   }
-  return uniq(out.map(normPath).filter(t => t.length >= 3 && !NOT_PATHS.has(t)));
+  return uniq(out.filter(looksLikePath).map(normPath).filter(t => t.length >= 3 && !NOT_PATHS.has(t)));
+}
+function looksLikePath(t) {
+  return /[/\\]/.test(t) || /^\.\w/.test(t) || /\w\.[a-z]{1,5}$/i.test(t);
 }
 function normPath(t) {
-  return t.toLowerCase().replace(/^\.\//, '').replace(/\*+/g, '').replace(/\/+$/, '').replace(/\/+/g, '/').trim();
+  return t.toLowerCase().replace(/\\/g, '/').replace(/^\.\//, '').replace(/\*+/g, '').replace(/\/+$/, '').replace(/\/+/g, '/').trim();
+}
+function segments(p) {
+  return normPath(p).split('/').filter(s => s && s !== '.');
+}
+// true when one path's segments appear contiguously inside the other's:
+// `protected/` ~ Edit(./protected/**), `scripts/a.mjs` ~ E:/repo/scripts/a.mjs
+function pathOverlap(a, b) {
+  const [x, y] = [segments(a), segments(b)];
+  if (!x.length || !y.length) return false;
+  const [short, long] = x.length <= y.length ? [x, y] : [y, x];
+  for (let i = 0; i + short.length <= long.length; i++) {
+    if (short.every((s, j) => long[i + j] === s)) return true;
+  }
+  return false;
+}
+
+// echo/printf text is what a hook says, not what it touches
+function stripEchoes(command) {
+  return command.replace(/\b(?:echo|printf)\b(?:\s+(?:-\w+|"(?:[^"\\]|\\.)*"|'[^']*'))+/g, ' ');
+}
+function commandPaths(h) {
+  return shellWords(stripEchoes(h.command)).map(w => w.replace(/^['"]|['"]$/g, '')).filter(looksLikePath);
 }
 
 function contentWords(text) {
   return uniq((text.toLowerCase().match(/[a-z][a-z-]{3,}/g) || []).filter(w => !STOPWORDS.has(w)));
 }
+// exact word, or a plural of it: "subagents" ~ subagent; "record" !~ recorder
+function sameWord(a, b) {
+  return a === b || a === b + 's' || b === a + 's' || a === b + 'es' || b === a + 'es';
+}
+function mechanismWords(h) {
+  const names = h.lane ? [h.lane] : h.scripts.map(s => s.replace(/\.\w+$/, ''));
+  return uniq(names.flatMap(n => n.toLowerCase().split(/[-_.]/)).filter(w => w.length >= 6));
+}
+function hookLabel(h) {
+  const name = h.lane ? `${h.scripts[0] || ''} ${h.lane}`.trim() : h.scripts.join(', ');
+  return name ? ` (${name})` : '';
+}
 
+// Score each mechanism (one hook entry or one permission rule) on its own and
+// take the best one. Signals from one mechanism add up; repeats of a weak
+// signal across many mechanisms do not.
 function matchDirective(d, surface) {
-  const evidence = [];
-  const hooksHit = new Set();
-  let score = 0;
+  const mechanisms = new Map(); // key -> {score, evidence[], hook}
+  const bump = (key, points, evidence, hook = null) => {
+    const m = mechanisms.get(key) || { score: 0, evidence: [], hook };
+    m.score += points;
+    m.evidence.push(evidence);
+    mechanisms.set(key, m);
+  };
   const dText = d.text;
-  const dPaths = pathTokens(d.raw);
+  // the project root (or a folder above it) names everything and nothing
+  const rootSegments = segments(ROOT);
+  const dPaths = pathTokens(d.raw).filter(p => {
+    const s = segments(p);
+    return !(s.length <= rootSegments.length && s.every((x, i) => rootSegments[i] === x));
+  });
   const dWords = contentWords(dText);
+  const enforcing = surface.hooks.filter(h => ENFORCING_EVENTS.has(h.event));
 
-  // signal 1: literal path overlap with a deny/ask rule or hook command (strong)
+  // signal 1: path overlap with a deny/ask rule or a path a hook command names (strong).
+  // A path every other hook names (a repo root, a scripts folder) says nothing.
+  const common = p => enforcing.length >= 4 && enforcing.filter(h => commandPaths(h).some(c => pathOverlap(p, c))).length / enforcing.length >= 0.5;
   for (const p of dPaths) {
     for (const perm of surface.permissions) {
-      if (perm.list === 'allow') continue;
-      const rp = normPath(perm.pattern || perm.rule);
-      if (rp && (rp.includes(p) || p.includes(rp))) {
-        score += 3;
-        evidence.push(`rule mentions \`${p}\`; ${perm.list} rule ${perm.rule} covers it (${perm.scope} settings)`);
+      if (perm.list === 'allow' || perm.inert || !perm.pattern) continue;
+      if (pathOverlap(p, perm.pattern)) {
+        bump(`perm:${perm.list}:${perm.rule}:${perm.scope}`, 3, `rule mentions \`${p}\`; ${perm.list} rule ${perm.rule} covers it (${perm.scope} settings)`);
       }
     }
-    for (const h of surface.hooks) {
-      if (h.command.toLowerCase().includes(p)) {
-        score += 3;
-        hooksHit.add(h);
-        evidence.push(`rule mentions \`${p}\`; a ${h.event} hook command references it (matcher: ${h.matcher})`);
+    if (common(p)) continue;
+    for (const h of enforcing) {
+      if (commandPaths(h).some(c => pathOverlap(p, c))) {
+        bump(`hook:${h.id}`, 3, `rule mentions \`${p}\`; a ${h.event} hook${hookLabel(h)} passes that path (matcher: ${h.matcher})`, h);
       }
     }
   }
 
-  // signal 2: tool names (explicit, or via concept words like "subagent")
-  const toolsInRule = new Set();
-  for (const t of TOOL_NAMES) if (new RegExp(`\\b${t}\\b`).test(d.raw)) toolsInRule.add(t);
+  // signal 2: tool names (explicit, or via concept words like "subagent").
+  // Only tool events carry tool matchers; a PostToolUse hook acts after the fact.
+  const toolsInRule = toolsNamedIn(d.raw);
   for (const [word, tools] of Object.entries(CONCEPT_TOOLS)) {
     if (new RegExp(`\\b${word}\\b`, 'i').test(dText)) tools.forEach(t => toolsInRule.add(t));
   }
-  for (const h of surface.hooks) {
+  for (const h of enforcing) {
+    if (!TOOL_EVENTS.has(h.event)) continue;
     const overlap = [...toolsInRule].filter(n => matcherMatchesTool(h.matcher, n));
     if (overlap.length) {
-      score += 2;
-      hooksHit.add(h);
-      evidence.push(`rule concerns ${overlap.join('/')}; a ${h.event} hook matches ${h.matcher}` +
-        (h.scripts.length ? ` (${h.scripts.join(', ')})` : ''));
+      bump(`hook:${h.id}`, PREVENTING_EVENTS.has(h.event) ? 2 : 1,
+        `rule concerns ${overlap.join('/')}; a ${h.event} hook${hookLabel(h)} matches ${h.matcher}`, h);
     }
   }
   for (const perm of surface.permissions) {
-    if (perm.list !== 'allow' && toolsInRule.has(perm.tool)) {
-      score += 1;
-      evidence.push(`rule concerns ${perm.tool}; ${perm.list} rule ${perm.rule} exists`);
+    if (perm.list !== 'allow' && !perm.inert && toolsInRule.has(perm.tool)) {
+      bump(`perm:${perm.list}:${perm.rule}:${perm.scope}`, 1, `rule concerns ${perm.tool}; ${perm.list} rule ${perm.rule} exists`);
     }
   }
 
-  // signal 3: shared words with hook script names (subagent-guard.mjs → subagent).
-  // 6-char minimum: short generic words (guard, vault, gate) matched everything
-  for (const h of surface.hooks) {
-    const scriptWords = h.scripts.flatMap(s => s.replace(/\.\w+$/, '').split(/[-_.]/)).filter(w => w.length >= 6);
-    const shared = scriptWords.filter(w => dWords.some(dw => dw === w || dw.startsWith(w) || w.startsWith(dw)));
+  // signal 3: shared words with the mechanism's name (subagent-guard.mjs → subagent;
+  // adapter.mjs askgate → askgate). 6-char minimum: guard, vault, gate match everything.
+  for (const h of enforcing) {
+    const shared = mechanismWords(h).filter(w => dWords.some(dw => sameWord(dw, w)));
     if (shared.length) {
-      score += Math.min(shared.length, 2);
-      hooksHit.add(h);
-      evidence.push(`shares "${shared.join('", "')}" with hook script ${h.scripts.join(', ')} (${h.event}, matcher: ${h.matcher})`);
+      bump(`hook:${h.id}`, Math.min(shared.length, 2),
+        `shares "${shared.join('", "')}" with hook${hookLabel(h)} (${h.event}, matcher: ${h.matcher})`, h);
     }
   }
 
+  const ranked = [...mechanisms.values()].sort((a, b) => b.score - a.score);
+  const score = ranked.length ? ranked[0].score : 0;
   const verdict = score >= 3 ? 'likely' : score >= 2 ? 'possible' : 'prose';
-  return { verdict, score, evidence: uniq(evidence).slice(0, 4), hooksHit };
+  // every hook that contributed counts toward coverage once the rule itself is enforced
+  const hooksHit = new Set(ranked.filter(m => m.hook).map(m => m.hook));
+  // show the deciding mechanism, plus any other that scores at least "possible"
+  const shown = ranked.filter((m, i) => i === 0 || m.score >= 2);
+  return { verdict, score, evidence: uniq(shown.flatMap(m => m.evidence)).slice(0, 4), hooksHit };
 }
 
 function matcherMatchesTool(matcher, tool) {
@@ -814,15 +1007,16 @@ function buildEnforcementMap(directives, surface, findings) {
   }
 
   // the reverse check: enforcement that exists with no written rule behind it.
-  // SessionStart is exempt (context injection, not enforcement of a rule).
+  // Only enforcing events count; context injection and observers enforce nothing.
   const seen = new Set();
   for (const h of surface.hooks) {
-    if (hooksCovered.has(h) || h.event === 'SessionStart') continue;
-    const key = `${h.event}|${h.matcher}|${h.scripts.join(',')}`;
+    if (hooksCovered.has(h) || !ENFORCING_EVENTS.has(h.event)) continue;
+    const key = `${h.event}|${h.matcher}|${h.scripts.join(',')}|${h.lane || ''}`;
     if (seen.has(key)) continue;
     seen.add(key);
+    const name = h.lane ? `${h.scripts[0]} ${h.lane}` : h.scripts.join(', ');
     findings.push(info('unwritten-hook',
-      `a ${h.event} hook (matcher: ${h.matcher}${h.scripts.length ? `, ${h.scripts.join(', ')}` : ''}) enforces something no CLAUDE.md rule states — it works, and nothing documents it`));
+      `a ${h.event} hook (matcher: ${h.matcher}${name ? `, ${name}` : ''}, ${h.scope} settings) can enforce something no memory-file rule describes — document it or remove it`));
   }
   return map;
 
@@ -853,7 +1047,7 @@ function checkDuplication(directives, findings) {
 }
 
 function oppositePolarity(a, b) {
-  const neg = /\b(never|do not|don't|not allowed|forbidden|banned|no)\b/i;
+  const neg = /\b(never|do not|don't|not allowed|forbidden|banned|prohibited|no)\b/i;
   const pos = /\b(always|must|require|do)\b/i;
   return (neg.test(a) && pos.test(b) && !neg.test(b)) || (neg.test(b) && pos.test(a) && !neg.test(a));
 }
@@ -981,7 +1175,40 @@ function gitignoreCovers(text, path) {
 }
 
 // ---------- context cost ----------
-function contextCost(files) {
+// What hooks inject. SessionStart output joins every session's context and
+// UserPromptSubmit output joins every prompt. This audit never runs hooks, so
+// it counts what it can read (echo/printf literals, files a hook cats) and
+// names the scripts whose stdout reaches the model unmeasured.
+function hookContext(hooks) {
+  const out = {};
+  for (const [key, event] of [['sessionStart', 'SessionStart'], ['userPromptSubmit', 'UserPromptSubmit']]) {
+    const list = hooks.filter(h => h.event === event && h.type === 'command');
+    let chars = 0; let unmeasuredHooks = 0;
+    const unmeasured = new Set();
+    for (const h of list) {
+      for (const m of h.command.matchAll(/\b(?:echo|printf)\b((?:\s+(?:-\w+|"(?:[^"\\]|\\.)*"|'[^']*'))+)/g)) {
+        for (const q of m[1].matchAll(/"((?:[^"\\]|\\.)*)"|'([^']*)'/g)) chars += (q[1] ?? q[2]).length + 1;
+      }
+      const words = shellWords(h.command).map(w => w.replace(/^['"]|['"]$/g, ''));
+      words.forEach((w, i) => {
+        const next = words[i + 1];
+        if (w !== 'cat' || !next || next.includes('$') || !looksLikePath(next)) return;
+        const text = tryRead(resolve(ROOT, next));
+        if (text !== null) chars += text.length;
+      });
+      const loud = h.command.split(/;|&&|\|\|/).filter(seg => extractScriptRefs(seg).length &&
+        !/(?:^|\s)1?>\s*(?:\/dev\/null|\$null|nul)(?:\s|$)/i.test(seg) && !/\|\s*Out-Null/i.test(seg));
+      if (loud.length) {
+        unmeasuredHooks++;
+        for (const seg of loud) for (const s of extractScriptRefs(seg)) unmeasured.add(s.replace(/^['"]|['"]$/g, '').split(/[/\\]/).pop());
+      }
+    }
+    out[key] = { count: list.length, staticEstTokens: Math.ceil(chars / TOKEN_DIVISOR), unmeasured: [...unmeasured], unmeasuredHooks };
+  }
+  return out;
+}
+
+function contextCost(files, surface, findings) {
   const entry = f => {
     const text = tryRead(f.path) || '';
     return {
@@ -993,11 +1220,17 @@ function contextCost(files) {
   };
   const launch = files.filter(f => f.launch).map(entry);
   const onDemand = files.filter(f => !f.launch).map(entry);
+  const hooks = hookContext(surface.hooks);
+  const s = hooks.sessionStart;
+  if (s.unmeasuredHooks) {
+    findings.push(info('hook-context',
+      `${s.unmeasuredHooks} SessionStart hook command${s.unmeasuredHooks === 1 ? '' : 's'} print script output into every session (${s.unmeasured.join(', ')}) — this audit never runs hooks, so that context is not in the estimate`));
+  }
   return {
     method: `chars / ${TOKEN_DIVISOR}, HTML comments stripped first (the loader strips them too). An estimate, not a tokenizer.`,
-    launch, onDemand,
-    launchTokens: launch.reduce((s, f) => s + f.estTokens, 0),
-    onDemandTokens: onDemand.reduce((s, f) => s + f.estTokens, 0),
+    launch, onDemand, hooks,
+    launchTokens: launch.reduce((sum, f) => sum + f.estTokens, 0),
+    onDemandTokens: onDemand.reduce((sum, f) => sum + f.estTokens, 0),
   };
 }
 
@@ -1016,7 +1249,7 @@ function scoreReport(map, cost, findings) {
     ? Math.round(100 * enforceable.reduce((s, m) => s + (credit[m.verdict] || 0), 0) / enforceable.length)
     : 100;
 
-  const t = cost.launchTokens;
+  const t = cost.launchTokens + cost.hooks.sessionStart.staticEstTokens;
   const contextScore = t <= 2500 ? 100 : t >= 12000 ? 0 : Math.round(100 * (12000 - t) / 9500);
 
   let clarity = 100;
@@ -1068,6 +1301,11 @@ function printReport(report) {
     out.push(`  ${f.path.padEnd(46)} ${String(f.lines).padStart(5)} lines  ${fmtTokens(f.estTokens).padStart(8)} tokens` + (f.via ? C.dim(`  via ${f.via}`) : ''));
   }
   out.push(`  ${C.bold('loaded every session:')} ${fmtTokens(cost.launchTokens)} tokens`);
+  const ss = cost.hooks.sessionStart;
+  if (ss.count) {
+    out.push(`  ${C.bold('plus SessionStart hooks:')} ${ss.count} command${ss.count === 1 ? '' : 's'}, ${fmtTokens(ss.staticEstTokens)} tokens of literal text` +
+      (ss.unmeasuredHooks ? C.dim(`; ${ss.unmeasuredHooks} print script output this audit cannot measure (${clip(ss.unmeasured.join(', '), 60)})`) : ''));
+  }
   if (cost.onDemand.length) {
     out.push(C.dim(`  on demand (${cost.onDemand.length} nested/path-scoped files): ${fmtTokens(cost.onDemandTokens)} tokens`));
   }
@@ -1126,14 +1364,14 @@ function main() {
   checkClarity(files, directives, findings);
   checkScopedRules(files, findings);
   checkLocalGitignore(files, findings);
-  const cost = contextCost(files);
+  const cost = contextCost(files, surface, findings);
   const score = scoreReport(map, cost, findings);
 
   const report = {
     version: VERSION, root: ROOT.split(sep).join('/'),
     score, cost, map, findings,
     surface: {
-      hooks: surface.hooks.map(h => ({ event: h.event, matcher: h.matcher, type: h.type, scripts: h.scripts, scope: h.scope })),
+      hooks: surface.hooks.map(h => ({ event: h.event, matcher: h.matcher, type: h.type, scripts: h.scripts, lane: h.lane, scope: h.scope })),
       permissions: surface.permissions,
     },
   };
