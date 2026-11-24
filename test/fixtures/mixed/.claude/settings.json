@@ -1,6 +1,6 @@
 {
   "permissions": {
-    "deny": ["Write(./protected/**)"]
+    "deny": ["Edit(./protected/**)"]
   },
   "hooks": {
     "PreToolUse": [

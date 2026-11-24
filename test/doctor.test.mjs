@@ -137,7 +137,7 @@ test('nonexistent directory: exit 2', () => {
 test('json report carries the settings surface for the judgment layer', () => {
   const { report } = run(fixture('mixed'));
   assert.ok(report.surface.hooks.some(h => h.scripts.includes('subagent-guard.mjs')));
-  assert.ok(report.surface.permissions.some(p => p.rule === 'Write(./protected/**)'));
+  assert.ok(report.surface.permissions.some(p => p.rule === 'Edit(./protected/**)'));
 });
 
 test('findings 1-2: script claims require an existing script and active hooks', () => {
@@ -329,4 +329,144 @@ test('script paths support args, spaces, drive paths, and project placeholders',
     hooks: { PostToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: `node "${absoluteScript}"` }] }] },
   });
   assert.equal(rule(run(absolute).report, 'run checks').verdict, 'wired');
+});
+
+// ---------- accuracy regressions (2026-11-24 audit) ----------
+const hookOn = (event, matcher, command) => ({ [event]: [{ ...(matcher === null ? {} : { matcher }), hooks: [{ type: 'command', command }] }] });
+
+test('accuracy 1: a hook whose script is missing is an error, not silently dropped', () => {
+  const dir = project({ 'CLAUDE.md': '- Never run curl in Bash.' }, { hooks: hookOn('PreToolUse', 'Bash', 'node scripts/gone-guard.mjs') });
+  const { code, report } = run(dir);
+  assert.equal(code, 1);
+  const f = report.findings.find(x => x.code === 'hook-script-missing');
+  assert.ok(f, `missing hook-script-missing in ${report.findings.map(x => x.code)}`);
+  assert.match(f.msg, /gone-guard\.mjs/);
+  const unresolvable = project({ 'CLAUDE.md': '# Rules' }, { hooks: hookOn('PreToolUse', 'Bash', 'node "$TOOLS_DIR/guard.mjs"') });
+  assert.equal(finding(run(unresolvable).report, 'hook-script-missing'), false, 'an unexpandable path is unknown, not missing');
+  const echoed = project({ 'CLAUDE.md': '# Rules' }, { hooks: hookOn('SessionStart', null, 'echo "state absent — run: node scripts/brief-render.mjs"') });
+  const echoedReport = run(echoed).report;
+  assert.equal(finding(echoedReport, 'hook-script-missing'), false, 'a script named inside echo text is not run');
+  assert.equal(echoedReport.cost.hooks.sessionStart.count, 1, 'the echo hook stays on the surface');
+});
+
+test('accuracy 4b: the project root is not path evidence; a name match counts toward coverage of an enforced rule', () => {
+  const dir = project({ 'CLAUDE.md': '- Never write to `secrets/`.', 'guard.mjs': '' }, {
+    permissions: { deny: ['Edit(./secrets/**)'] },
+    hooks: hookOn('PreToolUse', 'Bash', 'node guard.mjs secrets-guard'),
+  });
+  const rooted = project({ 'guard.mjs': '' }, {});
+  writeFileSync(join(rooted, '.claude', 'settings.json'), JSON.stringify({ hooks: hookOn('PreToolUse', 'Edit', `node guard.mjs --root "${rooted}"`) }));
+  writeFileSync(join(rooted, 'CLAUDE.md'), `- Always work inside \`${rooted.split('\\').join('/')}\`.\n`);
+  const rootedReport = run(rooted).report;
+  assert.equal(rootedReport.surface.hooks.length, 1);
+  assert.equal(rule(rootedReport, 'work inside').verdict, 'prose');
+  const notes = run(dir).report.findings.filter(f => f.code === 'unwritten-hook').map(f => f.msg).join('\n');
+  assert.doesNotMatch(notes, /secrets-guard/, 'secrets-guard shares a name with an enforced rule');
+});
+
+test('accuracy 2: one weak signal repeated across hook entries stays prose', () => {
+  const hooks = { PostToolUse: ['Edit', 'Write', 'NotebookEdit', 'MultiEdit'].map(matcher => ({ matcher, hooks: [{ type: 'command', command: 'node formatter.mjs' }] })) };
+  const dir = project({ 'CLAUDE.md': '- Never skip the formatter.', 'formatter.mjs': '' }, { hooks });
+  assert.equal(rule(run(dir).report, 'formatter').verdict, 'prose');
+});
+
+test('accuracy 3: non-enforcing events neither match tools nor count as unwritten enforcement', () => {
+  const dir = project({ 'CLAUDE.md': '- Never run curl in Bash.', 'check.mjs': '' }, {
+    hooks: { ...hookOn('SessionStart', '*', 'node check.mjs'), ...hookOn('SessionEnd', null, 'echo bye') },
+  });
+  const { report } = run(dir);
+  assert.equal(rule(report, 'curl in Bash').verdict, 'prose');
+  assert.equal(finding(report, 'unwritten-hook'), false);
+});
+
+test('accuracy 4: path overlap ignores echo text and bare words, keeps real path arguments', () => {
+  const echoed = project({ 'CLAUDE.md': '- Never edit `config/prod.json` by hand.', 'log.mjs': '' },
+    { hooks: hookOn('PreToolUse', 'Bash', 'node log.mjs; echo "config/prod.json changed"') });
+  assert.equal(rule(run(echoed).report, 'prod.json').verdict, 'prose');
+  const word = project({ 'CLAUDE.md': '- Always rebase onto `main` before pushing.', 'guard.mjs': '' },
+    { hooks: hookOn('PreToolUse', 'Bash', 'node guard.mjs --branch main') });
+  assert.equal(rule(run(word).report, 'rebase').verdict, 'prose');
+  const real = project({ 'CLAUDE.md': '- Never edit `config/prod.json` by hand.', 'guard.mjs': '' },
+    { hooks: hookOn('PreToolUse', 'Bash', 'node guard.mjs config/prod.json') });
+  assert.equal(rule(run(real).report, 'prod.json').verdict, 'likely');
+});
+
+test('accuracy 5: dispatcher hooks keep one identity per lane', () => {
+  const hooks = {
+    PreToolUse: [
+      { matcher: 'Edit', hooks: [{ type: 'command', command: 'node adapter.mjs secrets-guard' }] },
+      { matcher: 'AskUserQuestion', hooks: [{ type: 'command', command: 'node adapter.mjs askgate' }] },
+    ],
+  };
+  const dir = project({ 'CLAUDE.md': '- Every adapter must log its decisions.', 'adapter.mjs': '' }, { hooks });
+  const notes = run(dir).report.findings.filter(f => f.code === 'unwritten-hook').map(f => f.msg).join('\n');
+  assert.match(notes, /secrets-guard/);
+  assert.match(notes, /askgate/);
+  const annotated = project({ 'CLAUDE.md': '- Never write secrets. <!-- enforced-by: script secrets-guard -->', 'adapter.mjs': '' }, { hooks });
+  assert.equal(rule(run(annotated).report, 'write secrets').verdict, 'wired');
+});
+
+test('accuracy 6: prohibited and refuses read as hard rules', () => {
+  const report = run(project({ 'CLAUDE.md': '- Force-push is prohibited.\n- The guard refuses unsigned tags.' }, {})).report;
+  assert.equal(rule(report, 'Force-push').strength, 'hard');
+  assert.equal(rule(report, 'unsigned tags').strength, 'hard');
+});
+
+test('accuracy 7: English words and hyphen compounds are not tool names', () => {
+  const hooks = { PreToolUse: [
+    { matcher: 'Agent', hooks: [{ type: 'command', command: 'node guard.mjs' }] },
+    { matcher: 'Read', hooks: [{ type: 'command', command: 'node guard.mjs' }] },
+  ] };
+  const report = run(project({ 'CLAUDE.md': '- Agent-created commits must use the house identity.\n- Read the style guide first; it is required.\n- Never call `Agent` without approval.', 'guard.mjs': '' }, { hooks })).report;
+  assert.equal(rule(report, 'Agent-created').verdict, 'prose');
+  assert.equal(rule(report, 'style guide').verdict, 'prose');
+  assert.notEqual(rule(report, 'without approval').verdict, 'prose');
+});
+
+test('accuracy 8: managed settings and enabled plugin hooks are part of the surface', () => {
+  const managed = project({ 'managed-settings.json': JSON.stringify({ permissions: { deny: ['Edit(./secrets/**)'] } }),
+    'managed-settings.d/20-hooks.json': JSON.stringify({ allowManagedHooksOnly: true }) });
+  const profile = project({ 'settings.json': '{}' });
+  const dir = project({ 'CLAUDE.md': '- Never write secrets. <!-- enforced-by: deny Edit(./secrets/**) -->', 'guard.mjs': '' },
+    { hooks: hookOn('PreToolUse', 'Bash', 'node guard.mjs') });
+  const managedRun = runRaw([dir, '--json', '--no-ancestors'], { CLAUDE_CONFIG_DIR: profile, PROVE_IT_MANAGED_DIR: managed });
+  assert.equal(rule(managedRun.report, 'write secrets').verdict, 'wired');
+  assert.ok(managedRun.report.surface.permissions.some(p => p.scope === 'managed'));
+  assert.equal(managedRun.report.surface.hooks.length, 0, 'allowManagedHooksOnly drops project hooks');
+
+  const pluginRoot = project({ 'hooks/hooks.json': JSON.stringify({ hooks: hookOn('PreToolUse', 'Bash', 'node "${CLAUDE_PLUGIN_ROOT}/scripts/plug-guard.mjs"') }), 'scripts/plug-guard.mjs': '' });
+  const withPlugin = project({
+    'settings.json': JSON.stringify({ enabledPlugins: { 'demo@market': true } }),
+    'plugins/installed_plugins.json': JSON.stringify({ version: 2, plugins: { 'demo@market': [{ scope: 'user', installPath: pluginRoot }] } }),
+  });
+  const plain = project({ 'CLAUDE.md': '- Always guard shell. <!-- enforced-by: script plug-guard.mjs -->' }, {});
+  const pluginRun = runRaw([plain, '--json', '--no-ancestors'], { CLAUDE_CONFIG_DIR: withPlugin, PROVE_IT_MANAGED_DIR: join(plain, 'no-managed') });
+  assert.equal(rule(pluginRun.report, 'guard shell').verdict, 'wired');
+  assert.ok(pluginRun.report.surface.hooks.some(h => h.scope === 'plugin:demo@market'));
+});
+
+test('accuracy 9: SessionStart hook output is reported as context the audit cannot fully measure', () => {
+  const dir = project({ 'CLAUDE.md': '# Rules', 'inject.mjs': '' }, { hooks: { SessionStart: [{ hooks: [
+    { type: 'command', command: 'node inject.mjs' },
+    { type: 'command', command: 'node inject.mjs >/dev/null 2>&1' },
+    { type: 'command', command: `echo "${'x'.repeat(400)}"` },
+  ] }] } });
+  const { report } = run(dir);
+  assert.equal(report.cost.hooks.sessionStart.count, 3);
+  assert.deepEqual(report.cost.hooks.sessionStart.unmeasured, ['inject.mjs']);
+  assert.equal(report.cost.hooks.sessionStart.unmeasuredHooks, 1, 'output sent to /dev/null is not context');
+  assert.ok(report.cost.hooks.sessionStart.staticEstTokens >= 100);
+  assert.equal(finding(report, 'hook-context'), true);
+});
+
+test('accuracy 12: Write, Glob and Grep path rules never match and cannot enforce', () => {
+  const dir = project({ 'CLAUDE.md': '- Never write to `secrets/`. <!-- enforced-by: deny Write(./secrets/**) -->\n- Never touch `vault/` files.' },
+    { permissions: { deny: ['Write(./secrets/**)', 'Grep(./vault/**)'] } });
+  const { code, report } = run(dir);
+  assert.equal(code, 1);
+  const inert = report.findings.filter(f => f.code === 'inert-permission');
+  assert.equal(inert.length, 2);
+  assert.match(inert[0].msg, /Edit\(\.\/secrets\/\*\*\)/);
+  assert.equal(rule(report, 'write to').verdict, 'broken');
+  assert.equal(rule(report, 'vault/').verdict, 'prose');
 });

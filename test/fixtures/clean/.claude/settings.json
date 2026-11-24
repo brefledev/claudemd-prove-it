@@ -1,6 +1,6 @@
 {
   "permissions": {
-    "deny": ["Write(./secrets/**)", "Read(./secrets/**)"]
+    "deny": ["Edit(./secrets/**)", "Read(./secrets/**)"]
   },
   "hooks": {
     "PostToolUse": [
